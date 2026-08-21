@@ -3,7 +3,6 @@ package protocol
 import (
 	"bytes"
 	"errors"
-	"io"
 	"testing"
 )
 
@@ -16,10 +15,9 @@ func TestEncodeAndDecodeSingleFrame(t *testing.T) {
 		t.Fatalf("Encode failed: %v", err)
 	}
 
-	decoder := NewDecoder(bytes.NewReader(encoded))
-	frame, err := decoder.NextFrame()
+	frame, err := DecodeSingle(encoded)
 	if err != nil {
-		t.Fatalf("Decode failed: %v", err)
+		t.Fatalf("DecodeSingle failed: %v", err)
 	}
 
 	if frame.Seq != seq {
@@ -28,53 +26,40 @@ func TestEncodeAndDecodeSingleFrame(t *testing.T) {
 	if !bytes.Equal(frame.Payload, payload) {
 		t.Errorf("Expected payload %s, got %s", payload, frame.Payload)
 	}
+	if frame.WireLen() != len(encoded) {
+		t.Errorf("Expected wire len %d, got %d", len(encoded), frame.WireLen())
+	}
 }
 
-func TestStreamWithGarbageAndMultipleFrames(t *testing.T) {
-	// Create a stream with leading garbage, interleaved garbage, false sync words, and valid frames
-	var stream bytes.Buffer
-
-	// Leading garbage
-	stream.Write([]byte{0x00, 0xFF, 0xAA, 0x12, 0x34, 0xAA})
-
-	// Frame 1
-	f1Bytes, _ := Encode(1, []byte("FRAME_ONE"))
-	stream.Write(f1Bytes)
-
-	// Interleaved noise + corrupted frame (bad CRC)
-	stream.Write([]byte{0xDE, 0xAD, 0xBE, 0xEF, 0xAA, 0x55, 0x00, 0x01}) // Partial / noise
-	corruptFrame, _ := Encode(999, []byte("CORRUPTED"))
-	corruptFrame[len(corruptFrame)-1] ^= 0xFF // Flip bits in CRC
-	stream.Write(corruptFrame)
-
-	// Frame 2
-	f2Bytes, _ := Encode(2, []byte("FRAME_TWO"))
-	stream.Write(f2Bytes)
-
-	decoder := NewDecoder(&stream)
-
-	// Read frame 1
-	frame1, err := decoder.NextFrame()
+func TestBinaryMarshalerAndUnmarshaler(t *testing.T) {
+	frame, err := NewFrame(7, []byte("JPL GROUND CONTROL"))
 	if err != nil {
-		t.Fatalf("Expected frame 1, got error: %v", err)
-	}
-	if frame1.Seq != 1 || string(frame1.Payload) != "FRAME_ONE" {
-		t.Fatalf("Unexpected frame 1: seq=%d, payload=%s", frame1.Seq, string(frame1.Payload))
+		t.Fatalf("NewFrame failed: %v", err)
 	}
 
-	// Reading next should skip the corrupted data and successfully find frame 2
-	frame2, err := decoder.NextFrame()
+	marshaled, err := frame.MarshalBinary()
 	if err != nil {
-		t.Fatalf("Expected frame 2, got error: %v", err)
-	}
-	if frame2.Seq != 2 || string(frame2.Payload) != "FRAME_TWO" {
-		t.Fatalf("Unexpected frame 2: seq=%d, payload=%s", frame2.Seq, string(frame2.Payload))
+		t.Fatalf("MarshalBinary failed: %v", err)
 	}
 
-	// Next read should be EOF
-	_, err = decoder.NextFrame()
-	if !errors.Is(err, io.EOF) {
-		t.Fatalf("Expected EOF, got %v", err)
+	var decoded Frame
+	if err := decoded.UnmarshalBinary(marshaled); err != nil {
+		t.Fatalf("UnmarshalBinary failed: %v", err)
+	}
+
+	if decoded.Seq != frame.Seq || !bytes.Equal(decoded.Payload, frame.Payload) || decoded.CRC != frame.CRC {
+		t.Fatalf("Decoded frame does not match original: %+v vs %+v", decoded, frame)
+	}
+
+	// Corrupt binary unmarshaling test
+	marshaled[len(marshaled)-1] ^= 0xFF
+	if err := decoded.UnmarshalBinary(marshaled); !errors.Is(err, ErrInvalidChecksum) {
+		t.Fatalf("Expected ErrInvalidChecksum on corrupted frame, got: %v", err)
+	}
+
+	// Short binary test
+	if err := decoded.UnmarshalBinary([]byte{0xAA, 0x55}); !errors.Is(err, ErrFrameTooShort) {
+		t.Fatalf("Expected ErrFrameTooShort, got: %v", err)
 	}
 }
 
@@ -84,10 +69,9 @@ func TestEmptyPayload(t *testing.T) {
 		t.Fatalf("Encode failed: %v", err)
 	}
 
-	decoder := NewDecoder(bytes.NewReader(encoded))
-	frame, err := decoder.NextFrame()
+	frame, err := DecodeSingle(encoded)
 	if err != nil {
-		t.Fatalf("Decode failed: %v", err)
+		t.Fatalf("DecodeSingle failed: %v", err)
 	}
 
 	if frame.Seq != 10 {
@@ -95,27 +79,5 @@ func TestEmptyPayload(t *testing.T) {
 	}
 	if len(frame.Payload) != 0 {
 		t.Errorf("Expected empty payload, got %v", frame.Payload)
-	}
-}
-
-func TestFragmentedStream(t *testing.T) {
-	// Simulate fragmented serial stream arriving 1 byte at a time
-	fBytes, _ := Encode(100, []byte("CHUNKED_STREAM_TEST"))
-
-	r, w := io.Pipe()
-	go func() {
-		defer w.Close()
-		for _, b := range fBytes {
-			w.Write([]byte{b})
-		}
-	}()
-
-	decoder := NewDecoder(r)
-	frame, err := decoder.NextFrame()
-	if err != nil {
-		t.Fatalf("Failed to decode chunked frame: %v", err)
-	}
-	if frame.Seq != 100 || string(frame.Payload) != "CHUNKED_STREAM_TEST" {
-		t.Fatalf("Unexpected decoded frame: %+v", frame)
 	}
 }

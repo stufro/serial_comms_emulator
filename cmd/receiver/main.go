@@ -1,73 +1,69 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 
+	"github.com/stufro/serial-protocol/internal/terminal"
 	"github.com/stufro/serial-protocol/protocol"
 	"github.com/stufro/serial-protocol/transport"
 )
 
-// ANSI color codes
-const (
-	colorReset  = "\033[0m"
-	colorGreen  = "\033[1;32m"
-	colorAmber  = "\033[1;33m"
-	colorCyan   = "\033[1;36m"
-	colorRed    = "\033[1;31m"
-	colorGray   = "\033[38;5;245m" // Light grey for in-flight temporary state
-	colorDim    = "\033[2m"
-	colorBold   = "\033[1m"
-	colorOrange = "\033[38;5;208m"
-)
-
-func printReceiverBanner(station string, port string) {
-	fmt.Print(colorCyan)
-	fmt.Println(`  ____       _   _        __ _           _             `)
-	fmt.Println(` |  _ \ __ _| |_| |__   / _(_)_ __   __| | ___ _ __   `)
-	fmt.Println(` | |_) / _` + "`" + ` | __| '_ \ | |_| | '_ \ / _` + "`" + ` |/ _ \ '__|  `)
-	fmt.Println(` |  __/ (_| | |_| | | ||  _| | | | | (_| |  __/ |     `)
-	fmt.Println(` |_|   \__,_|\__|_| |_||_| |_|_| |_|\__,_|\___|_|     `)
-	fmt.Println(`          DEEP SPACE NETWORK TELEMETRY RECEIVER       `)
-	fmt.Print(colorReset)
-	fmt.Println(colorDim + strings.Repeat("─", 64) + colorReset)
-	fmt.Printf("%s[STATION]%s  %s%s%s\n", colorAmber, colorReset, colorBold, station, colorReset)
-	fmt.Printf("%s[PORT]%s     %s\n", colorAmber, colorReset, port)
-	fmt.Printf("%s[STATUS]%s   %sLISTENING FOR SYNC (0xAA 0x55)...%s\n", colorAmber, colorReset, colorGreen, colorReset)
-	fmt.Println(colorDim + strings.Repeat("─", 64) + colorReset)
-	fmt.Println()
+type receiverConfig struct {
+	portPath string
+	baudRate int
+	station  string
 }
 
-func main() {
-	portPath := flag.String("port", "/tmp/ttyV1", "Serial device or PTY path")
-	baudRate := flag.Int("baud", 115200, "Baud rate")
-	station := flag.String("station", "JPL MISSION CONTROL (PASADENA, CA)", "Receiver station identifier")
-	flag.Parse()
+func parseFlags(args []string) (*receiverConfig, error) {
+	fs := flag.NewFlagSet("receiver", flag.ContinueOnError)
+	cfg := &receiverConfig{}
 
-	port, err := transport.OpenPort(*portPath, *baudRate)
+	fs.StringVar(&cfg.portPath, "port", "/tmp/ttyV1", "Serial device or PTY path")
+	fs.IntVar(&cfg.baudRate, "baud", 115200, "Baud rate")
+	fs.StringVar(&cfg.station, "station", "JPL MISSION CONTROL (PASADENA, CA)", "Receiver station identifier")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+func printReceiverHeader(cfg *receiverConfig) {
+	terminal.PrintBanner(
+		"Pathfinder",
+		"DEEP SPACE NETWORK TELEMETRY RECEIVER",
+		cfg.station,
+		cfg.portPath,
+		[2]string{"STATUS", fmt.Sprintf("%sLISTENING FOR SYNC (0xAA 0x55)...%s", terminal.Green, terminal.Reset)},
+	)
+}
+
+func run(ctx context.Context, args []string, out io.Writer) error {
+	cfg, err := parseFlags(args)
 	if err != nil {
-		log.Fatalf("Failed to open port %s: %v", *portPath, err)
+		return err
+	}
+
+	port, err := transport.OpenPort(cfg.portPath, cfg.baudRate)
+	if err != nil {
+		return fmt.Errorf("failed to open port %s: %w", cfg.portPath, err)
 	}
 	defer port.Close()
 
-	printReceiverBanner(*station, *portPath)
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	printReceiverHeader(cfg)
 
 	decoder := protocol.NewDecoder(port)
-
 	var mu sync.Mutex
 
-	// Attach progress callback to render sliding last-32-bytes in light grey on a single line
+	// In-flight progress callback to render sliding 32-byte window on a single line
 	decoder.SetOnProgress(func(rawBuffer []byte, stage string) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -80,9 +76,8 @@ func main() {
 		}
 		hexPreview := prefix + fmt.Sprintf("% X", displayBytes)
 
-		// \r = return to line start, \033[K = clear line
-		fmt.Printf("\r\033[K%s⏳ [INCOMING STREAM] %s | Raw: [%s]%s", colorGray, stage, hexPreview, colorReset)
-		os.Stdout.Sync()
+		fmt.Fprintf(out, "%s%s⏳ [INCOMING STREAM] %s | Raw: [%s]%s",
+			terminal.ClearLine, terminal.Gray, stage, hexPreview, terminal.Reset)
 	})
 
 	frameChan := make(chan *protocol.Frame)
@@ -106,37 +101,47 @@ func main() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			mu.Lock()
+			fmt.Fprint(out, terminal.ClearLine)
+			fmt.Fprintf(out, "\n%s[RECEIVER OFFLINE] Total messages decoded: %d%s\n",
+				terminal.Amber, totalFrames, terminal.Reset)
+			mu.Unlock()
+			return nil
+
 		case frame := <-frameChan:
 			mu.Lock()
 			totalFrames++
 
 			// Clear temporary light grey progress line
-			fmt.Print("\r\033[K")
+			fmt.Fprint(out, terminal.ClearLine)
 
 			// Print finalized transmission banner
-			fmt.Printf("%s▼ [INCOMING TRANSMISSION]%s Frame #%03d | CRC: 0x%08X %s[OK]%s | Len: %d B\n",
-				colorGreen, colorReset, frame.Seq, frame.CRC, colorGreen, colorReset, len(frame.Payload))
-			fmt.Printf("  %s%s%s%s\n\n", colorBold, colorAmber, string(frame.Payload), colorReset)
-			os.Stdout.Sync()
+			fmt.Fprintf(out, "%s▼ [INCOMING TRANSMISSION]%s Frame #%03d | CRC: 0x%08X %s[OK]%s | Len: %d B\n",
+				terminal.Green, terminal.Reset, frame.Seq, frame.CRC, terminal.Green, terminal.Reset, len(frame.Payload))
+			fmt.Fprintf(out, "  %s%s%s%s\n\n", terminal.Bold, terminal.Amber, string(frame.Payload), terminal.Reset)
 			mu.Unlock()
 
 		case err := <-errChan:
 			mu.Lock()
-			fmt.Print("\r\033[K")
+			fmt.Fprint(out, terminal.ClearLine)
 			if errors.Is(err, io.EOF) {
-				fmt.Printf("\n%s[COMMS LOST] Stream closed (EOF).%s\n", colorRed, colorReset)
+				fmt.Fprintf(out, "\n%s[COMMS LOST] Stream closed (EOF).%s\n", terminal.Red, terminal.Reset)
 				mu.Unlock()
-				return
+				return nil
 			}
-			fmt.Printf("%s[PARSER WARNING] %v%s\n", colorRed, err, colorReset)
+			fmt.Fprintf(out, "%s[PARSER WARNING] %v%s\n", terminal.Red, err, terminal.Reset)
 			mu.Unlock()
-
-		case <-sigChan:
-			mu.Lock()
-			fmt.Print("\r\033[K")
-			fmt.Printf("\n%s[RECEIVER OFFLINE] Total messages decoded: %d%s\n", colorAmber, totalFrames, colorReset)
-			mu.Unlock()
-			return
 		}
+	}
+}
+
+func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
 	}
 }
