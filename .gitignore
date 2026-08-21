@@ -1,0 +1,16 @@
+# Compiled binaries
+/my-go-project
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Environment variables / IDEs
+.env
