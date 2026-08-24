@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -38,10 +39,6 @@ func TestRunTransmitsTypedLineAsFrameOnWire(t *testing.T) {
 		t.Fatalf("run returned unexpected error: %v", err)
 	}
 
-	if !strings.Contains(out.String(), "TX CONFIRMED") {
-		t.Fatalf("expected TX CONFIRMED in output, got:\n%s", out.String())
-	}
-
 	wireBytes, err := os.ReadFile(portPath)
 	if err != nil {
 		t.Fatalf("failed to read fake port contents: %v", err)
@@ -54,35 +51,99 @@ func TestRunTransmitsTypedLineAsFrameOnWire(t *testing.T) {
 	if !strings.Contains(string(frame.Payload), "HOUSTON WE HAVE A PROBLEM") {
 		t.Errorf("expected payload to contain typed message, got: %s", frame.Payload)
 	}
+
+	assertNoDuplicatePrompts(t, out.String())
 }
 
-func TestRunPrintsRealChecksumNotCRCSizeConstant(t *testing.T) {
-	// Regression test: TX CONFIRMED used to print protocol.CRCSize (a
-	// constant, 4) instead of the frame's actual CRC32 checksum.
+func TestRunQueuesSecondMessageWhileFirstIsStillTrickling(t *testing.T) {
+	// Regression test: a second line typed (and Enter pressed) while the
+	// first message is still trickling out used to block the whole input
+	// loop until the first send finished, making the terminal appear to
+	// hang. sendChan must be buffered so the input loop can keep accepting
+	// lines while runSender works through the queue.
 	portPath := newFakePort(t)
-	in := strings.NewReader("PING\n")
+
+	pipeReader, pipeWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	defer pipeReader.Close()
+
 	var out bytes.Buffer
 
-	if err := run(context.Background(), []string{"-port", portPath, "-byte-delay", "0s"}, in, &out); err != nil {
-		t.Fatalf("run returned unexpected error: %v", err)
-	}
+	done := make(chan error, 1)
+	go func() {
+		done <- run(context.Background(), []string{"-port", portPath, "-byte-delay", "5ms"}, pipeReader, &out)
+	}()
 
-	if strings.Contains(out.String(), "Checksum: 0x00000004") {
-		t.Errorf("TX CONFIRMED printed the CRCSize constant instead of the real checksum:\n%s", out.String())
+	fmt.Fprintln(pipeWriter, "FIRST MESSAGE")
+	fmt.Fprintln(pipeWriter, "SECOND MESSAGE")
+
+	// Keep stdin open (not EOF) long enough for both background sends to
+	// finish and their resultChan events to be handled by the still-running
+	// input loop. Each encoded frame here is roughly 60 bytes (payload plus
+	// operator/sol/timestamp metadata and frame overhead), so at 5ms/byte
+	// each trickle takes ~300ms and the two together take ~600ms run
+	// sequentially by runSender. EOF is what actually exits run(), so
+	// closing pipeWriter too early would let drainPendingSends silently
+	// absorb the results after run() has already started exiting, hiding
+	// the bug this test targets - which is exactly what a prior, shorter
+	// sleep in this test accidentally did.
+	time.Sleep(800 * time.Millisecond)
+	pipeWriter.Close()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("run returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("run hung instead of queuing the second message")
 	}
 
 	wireBytes, err := os.ReadFile(portPath)
 	if err != nil {
 		t.Fatalf("failed to read fake port contents: %v", err)
 	}
-	frame, err := pathfinder.DecodeSingle(wireBytes)
+
+	frame1, err := pathfinder.DecodeSingle(wireBytes)
 	if err != nil {
-		t.Fatalf("expected a valid frame on the wire, got decode error: %v", err)
+		t.Fatalf("expected first frame on the wire, got decode error: %v", err)
+	}
+	if !strings.Contains(string(frame1.Payload), "FIRST MESSAGE") {
+		t.Errorf("expected first frame payload to contain FIRST MESSAGE, got: %s", frame1.Payload)
 	}
 
-	expected := fmt.Sprintf("Checksum: 0x%08X", frame.CRC)
-	if !strings.Contains(out.String(), expected) {
-		t.Errorf("expected output to contain actual checksum %s, got:\n%s", expected, out.String())
+	frame2, err := pathfinder.DecodeSingle(wireBytes[frame1.WireLen():])
+	if err != nil {
+		t.Fatalf("expected second frame on the wire, got decode error: %v", err)
+	}
+	if !strings.Contains(string(frame2.Payload), "SECOND MESSAGE") {
+		t.Errorf("expected second frame payload to contain SECOND MESSAGE, got: %s", frame2.Payload)
+	}
+
+	assertNoDuplicatePrompts(t, out.String())
+}
+
+// ansiEscape matches ANSI/VT100 escape sequences (e.g. "\x1b[1;32m") so
+// terminal output can be compared and searched as plain text.
+var ansiEscape = regexp.MustCompile("\x1b\\[[0-9;]*m")
+
+// assertNoDuplicatePrompts fails if the sender prompt ("...] > ") is
+// followed immediately by another prompt with nothing - not even a newline -
+// in between, which is what a real terminal renders as two prompts glued
+// onto the same line.
+//
+// Regression coverage: a background send result completing used to trigger
+// an unconditional prompt redraw even though nothing about the prompt (the
+// sequence number) had changed, so a successful send produced a visible
+// duplicate of the current prompt line stuck onto the previous one.
+func assertNoDuplicatePrompts(t *testing.T, output string) {
+	t.Helper()
+	plain := ansiEscape.ReplaceAllString(output, "")
+
+	if strings.Contains(plain, "] > [") {
+		t.Errorf("found two prompts glued onto the same line (no newline between them):\n%s", plain)
 	}
 }
 

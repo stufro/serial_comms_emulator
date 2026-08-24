@@ -1,5 +1,4 @@
 # Compiled binaries
-/my-go-project
 *.exe
 *.exe~
 *.dll
@@ -14,3 +13,5 @@
 
 # Environment variables / IDEs
 .env
+
+/tmp

@@ -102,6 +102,14 @@ func (frame *Frame) MarshalBinary() ([]byte, error) {
 	return wire, nil
 }
 
+// parseHeader reads the sequence number and payload length from data, which
+// must be at least HeaderSize bytes and begin with the sync word.
+func parseHeader(data []byte) (seq uint32, payloadLen int) {
+	seq = binary.BigEndian.Uint32(data[seqOffset:lenOffset])
+	payloadLen = int(binary.BigEndian.Uint16(data[lenOffset:payloadOffset]))
+	return seq, payloadLen
+}
+
 // UnmarshalBinary decodes raw bytes into the frame, validating sync and CRC32.
 func (frame *Frame) UnmarshalBinary(data []byte) error {
 	if len(data) < MinFrameSize {
@@ -111,8 +119,7 @@ func (frame *Frame) UnmarshalBinary(data []byte) error {
 		return ErrInvalidSync
 	}
 
-	seq := binary.BigEndian.Uint32(data[seqOffset:lenOffset])
-	payloadLen := int(binary.BigEndian.Uint16(data[lenOffset:payloadOffset]))
+	seq, payloadLen := parseHeader(data)
 	expectedTotal := MinFrameSize + payloadLen
 
 	if len(data) < expectedTotal {

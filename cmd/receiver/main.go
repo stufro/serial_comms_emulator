@@ -16,6 +16,10 @@ import (
 	"github.com/stufro/serial-protocol/pathfinder"
 )
 
+// previewBytes is how much of the in-flight receive buffer the progress
+// line shows before truncating from the left.
+const previewBytes = 32
+
 type receiverConfig struct {
 	portPath string
 	baudRate int
@@ -23,14 +27,14 @@ type receiverConfig struct {
 }
 
 func parseFlags(args []string) (*receiverConfig, error) {
-	fs := flag.NewFlagSet("receiver", flag.ContinueOnError)
+	flagSet := flag.NewFlagSet("receiver", flag.ContinueOnError)
 	cfg := &receiverConfig{}
 
-	fs.StringVar(&cfg.portPath, "port", "/tmp/ttyV1", "Serial device or PTY path")
-	fs.IntVar(&cfg.baudRate, "baud", 115200, "Baud rate")
-	fs.StringVar(&cfg.station, "station", "JPL MISSION CONTROL (PASADENA, CA)", "Receiver station identifier")
+	flagSet.StringVar(&cfg.portPath, "port", "/tmp/ttyV1", "Serial device or PTY path")
+	flagSet.IntVar(&cfg.baudRate, "baud", 115200, "Baud rate")
+	flagSet.StringVar(&cfg.station, "station", "JPL MISSION CONTROL (PASADENA, CA)", "Receiver station identifier")
 
-	if err := fs.Parse(args); err != nil {
+	if err := flagSet.Parse(args); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -39,12 +43,91 @@ func parseFlags(args []string) (*receiverConfig, error) {
 func printReceiverHeader(out io.Writer, cfg *receiverConfig) {
 	terminal.PrintBanner(
 		out,
-		"Pathfinder",
 		"DEEP SPACE NETWORK TELEMETRY RECEIVER",
 		cfg.station,
 		cfg.portPath,
 		[2]string{"STATUS", fmt.Sprintf("%sLISTENING FOR SYNC (0xAA 0x55)...%s", terminal.Green, terminal.Reset)},
 	)
+}
+
+// bufferPreview renders up to the last previewBytes buffered bytes as hex,
+// marking left-truncation with an ellipsis.
+func bufferPreview(rawBuffer []byte) string {
+	if len(rawBuffer) > previewBytes {
+		return fmt.Sprintf("... % X", rawBuffer[len(rawBuffer)-previewBytes:])
+	}
+	return fmt.Sprintf("% X", rawBuffer)
+}
+
+// progressRenderer returns a decoder callback that renders the in-flight
+// receive buffer as a single self-overwriting status line. outputMu
+// serializes it against the frame/shutdown prints in receiveLoop.
+func progressRenderer(out io.Writer, outputMu *sync.Mutex) pathfinder.ProgressCallback {
+	return func(rawBuffer []byte, stage string) {
+		outputMu.Lock()
+		defer outputMu.Unlock()
+
+		fmt.Fprintf(out, "%s%s⏳ [INCOMING STREAM] %s | Raw: [%s]%s",
+			terminal.ClearLine, terminal.Gray, stage, bufferPreview(rawBuffer), terminal.Reset)
+	}
+}
+
+// decodeFrames feeds decoded frames onto frameChan until the underlying
+// reader fails (including EOF), which it reports on errChan before exiting.
+// Frame-level corruption never surfaces here: the decoder resynchronizes
+// internally, so any error means the stream itself is done.
+func decodeFrames(decoder *pathfinder.Decoder, frameChan chan<- *pathfinder.Frame, errChan chan<- error) {
+	for {
+		frame, err := decoder.NextFrame()
+		if err != nil {
+			errChan <- err
+			return
+		}
+		frameChan <- frame
+	}
+}
+
+// printFrame renders one successfully decoded transmission, replacing the
+// transient progress line.
+func printFrame(out io.Writer, frame *pathfinder.Frame) {
+	fmt.Fprint(out, terminal.ClearLine)
+	fmt.Fprintf(out, "%s▼ [INCOMING TRANSMISSION]%s Frame #%03d | CRC: 0x%08X %s[OK]%s | Len: %d B\n",
+		terminal.Green, terminal.Reset, frame.Seq, frame.CRC, terminal.Green, terminal.Reset, len(frame.Payload))
+	fmt.Fprintf(out, "  %s%s%s%s\n\n", terminal.Bold, terminal.Amber, string(frame.Payload), terminal.Reset)
+}
+
+// receiveLoop prints decoded frames as they arrive until the stream ends or
+// the context is cancelled.
+func receiveLoop(ctx context.Context, out io.Writer, outputMu *sync.Mutex, frameChan <-chan *pathfinder.Frame, errChan <-chan error) error {
+	totalFrames := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			outputMu.Lock()
+			fmt.Fprint(out, terminal.ClearLine)
+			fmt.Fprintf(out, "\n%s[RECEIVER OFFLINE] Total messages decoded: %d%s\n",
+				terminal.Amber, totalFrames, terminal.Reset)
+			outputMu.Unlock()
+			return nil
+
+		case frame := <-frameChan:
+			outputMu.Lock()
+			totalFrames++
+			printFrame(out, frame)
+			outputMu.Unlock()
+
+		case err := <-errChan:
+			outputMu.Lock()
+			fmt.Fprint(out, terminal.ClearLine)
+			outputMu.Unlock()
+			if errors.Is(err, io.EOF) {
+				fmt.Fprintf(out, "\n%s[COMMS LOST] Stream closed (EOF).%s\n", terminal.Red, terminal.Reset)
+				return nil
+			}
+			return fmt.Errorf("read error: %w", err)
+		}
+	}
 }
 
 func run(ctx context.Context, args []string, out io.Writer) error {
@@ -61,80 +144,15 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 
 	printReceiverHeader(out, cfg)
 
+	var outputMu sync.Mutex
 	decoder := pathfinder.NewDecoder(port)
-	var mu sync.Mutex
-
-	// In-flight progress callback to render sliding 32-byte window on a single line
-	decoder.SetOnProgress(func(rawBuffer []byte, stage string) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		displayBytes := rawBuffer
-		prefix := ""
-		if len(rawBuffer) > 32 {
-			displayBytes = rawBuffer[len(rawBuffer)-32:]
-			prefix = "... "
-		}
-		hexPreview := prefix + fmt.Sprintf("% X", displayBytes)
-
-		fmt.Fprintf(out, "%s%s⏳ [INCOMING STREAM] %s | Raw: [%s]%s",
-			terminal.ClearLine, terminal.Gray, stage, hexPreview, terminal.Reset)
-	})
+	decoder.SetOnProgress(progressRenderer(out, &outputMu))
 
 	frameChan := make(chan *pathfinder.Frame)
 	errChan := make(chan error, 1)
+	go decodeFrames(decoder, frameChan, errChan)
 
-	go func() {
-		for {
-			frame, err := decoder.NextFrame()
-			if err != nil {
-				// Any error here comes from the underlying reader (frame-level
-				// corruption is already resolved by resyncing inside NextFrame),
-				// so the stream is done.
-				errChan <- err
-				return
-			}
-			frameChan <- frame
-		}
-	}()
-
-	totalFrames := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			mu.Lock()
-			fmt.Fprint(out, terminal.ClearLine)
-			fmt.Fprintf(out, "\n%s[RECEIVER OFFLINE] Total messages decoded: %d%s\n",
-				terminal.Amber, totalFrames, terminal.Reset)
-			mu.Unlock()
-			return nil
-
-		case frame := <-frameChan:
-			mu.Lock()
-			totalFrames++
-
-			// Clear temporary light grey progress line
-			fmt.Fprint(out, terminal.ClearLine)
-
-			// Print finalized transmission banner
-			fmt.Fprintf(out, "%s▼ [INCOMING TRANSMISSION]%s Frame #%03d | CRC: 0x%08X %s[OK]%s | Len: %d B\n",
-				terminal.Green, terminal.Reset, frame.Seq, frame.CRC, terminal.Green, terminal.Reset, len(frame.Payload))
-			fmt.Fprintf(out, "  %s%s%s%s\n\n", terminal.Bold, terminal.Amber, string(frame.Payload), terminal.Reset)
-			mu.Unlock()
-
-		case err := <-errChan:
-			mu.Lock()
-			fmt.Fprint(out, terminal.ClearLine)
-			if errors.Is(err, io.EOF) {
-				fmt.Fprintf(out, "\n%s[COMMS LOST] Stream closed (EOF).%s\n", terminal.Red, terminal.Reset)
-				mu.Unlock()
-				return nil
-			}
-			fmt.Fprintf(out, "%s[PARSER WARNING] %v%s\n", terminal.Red, err, terminal.Reset)
-			mu.Unlock()
-		}
-	}
+	return receiveLoop(ctx, out, &outputMu, frameChan, errChan)
 }
 
 func main() {

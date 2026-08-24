@@ -2,7 +2,6 @@ package pathfinder
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 )
@@ -70,30 +69,43 @@ func (decoder *Decoder) NextFrame() (*Frame, error) {
 	}
 }
 
+// discard drops the first n buffered bytes, compacting the rest in place.
+func (decoder *Decoder) discard(n int) {
+	decoder.buffer = decoder.buffer[:copy(decoder.buffer, decoder.buffer[n:])]
+}
+
+// syncToFrameStart discards garbage until the buffer begins with the sync
+// word. It returns false when more data is needed; in that case any scanned
+// garbage is dropped, except a trailing first sync byte whose partner may
+// arrive in the next read.
+func (decoder *Decoder) syncToFrameStart() bool {
+	syncIdx := bytes.Index(decoder.buffer, SyncWord[:])
+	if syncIdx >= 0 {
+		decoder.discard(syncIdx)
+		return true
+	}
+
+	if len(decoder.buffer) == 0 {
+		return false
+	}
+
+	decoder.notify("Scanning stream for Sync (0xAA 0x55)...")
+	if decoder.buffer[len(decoder.buffer)-1] == SyncWord[0] {
+		decoder.buffer[0] = SyncWord[0]
+		decoder.buffer = decoder.buffer[:1]
+	} else {
+		decoder.buffer = decoder.buffer[:0]
+	}
+	return false
+}
+
 // extractFrame attempts to parse one complete frame out of the buffered data,
 // discarding garbage and resynchronizing on corruption as it goes.
 // It returns nil when more bytes are required.
 func (decoder *Decoder) extractFrame() *Frame {
 	for {
-		syncIdx := bytes.Index(decoder.buffer, SyncWord[:])
-		if syncIdx == -1 {
-			if len(decoder.buffer) > 0 {
-				decoder.notify("Scanning stream for Sync (0xAA 0x55)...")
-			}
-			// Discard scanned garbage, but keep a trailing first sync byte
-			// in case its partner arrives in the next read.
-			if len(decoder.buffer) > 0 && decoder.buffer[len(decoder.buffer)-1] == SyncWord[0] {
-				decoder.buffer[0] = SyncWord[0]
-				decoder.buffer = decoder.buffer[:1]
-			} else {
-				decoder.buffer = decoder.buffer[:0]
-			}
+		if !decoder.syncToFrameStart() {
 			return nil
-		}
-
-		// Discard any garbage bytes prior to sync word
-		if syncIdx > 0 {
-			decoder.buffer = decoder.buffer[:copy(decoder.buffer, decoder.buffer[syncIdx:])]
 		}
 
 		if len(decoder.buffer) < HeaderSize {
@@ -101,8 +113,7 @@ func (decoder *Decoder) extractFrame() *Frame {
 			return nil
 		}
 
-		seq := binary.BigEndian.Uint32(decoder.buffer[seqOffset:lenOffset])
-		payloadLen := int(binary.BigEndian.Uint16(decoder.buffer[lenOffset:payloadOffset]))
+		seq, payloadLen := parseHeader(decoder.buffer)
 		totalFrameLen := MinFrameSize + payloadLen
 
 		if len(decoder.buffer) < totalFrameLen {
@@ -116,12 +127,11 @@ func (decoder *Decoder) extractFrame() *Frame {
 		if err := frame.UnmarshalBinary(decoder.buffer[:totalFrameLen]); err != nil {
 			// Corrupt frame (CRC mismatch): the sync word was a false start.
 			// Slide 1 byte past it and resume searching.
-			decoder.buffer = decoder.buffer[:copy(decoder.buffer, decoder.buffer[1:])]
+			decoder.discard(1)
 			continue
 		}
 
-		// Valid frame: advance the buffer past it.
-		decoder.buffer = decoder.buffer[:copy(decoder.buffer, decoder.buffer[totalFrameLen:])]
+		decoder.discard(totalFrameLen)
 		return &frame
 	}
 }

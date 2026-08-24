@@ -42,7 +42,8 @@ type TrickleWriter struct {
 	byteDelay time.Duration
 }
 
-// NewTrickleWriter creates a TrickleWriter with the given delay and optional per-byte callback.
+// NewTrickleWriter creates a TrickleWriter with the given inter-byte delay.
+// A delay of zero (or less) writes in a single burst.
 func NewTrickleWriter(writer io.Writer, byteDelay time.Duration) *TrickleWriter {
 	return &TrickleWriter{
 		writer:    writer,
@@ -60,37 +61,39 @@ func (trickleWriter *TrickleWriter) WriteContext(ctx context.Context, data []byt
 	if len(data) == 0 {
 		return 0, nil
 	}
-
 	if trickleWriter.byteDelay <= 0 {
-		written, err := trickleWriter.writer.Write(data)
-		return written, err
+		return trickleWriter.writer.Write(data)
 	}
 
 	totalSent := 0
-	var single [1]byte
-
-	for index, sentByte := range data {
-		select {
-		case <-ctx.Done():
-			return totalSent, ctx.Err()
-		default:
+	for index := range data {
+		if err := ctx.Err(); err != nil {
+			return totalSent, err
 		}
 
-		single[0] = sentByte
-		written, err := trickleWriter.writer.Write(single[:])
+		written, err := trickleWriter.writer.Write(data[index : index+1])
+		totalSent += written
 		if err != nil {
 			return totalSent, err
 		}
-		totalSent += written
 
 		if index+1 < len(data) {
-			select {
-			case <-ctx.Done():
-				return totalSent, ctx.Err()
-			case <-time.After(trickleWriter.byteDelay):
+			if err := trickleWriter.waitByteDelay(ctx); err != nil {
+				return totalSent, err
 			}
 		}
 	}
 
 	return totalSent, nil
+}
+
+// waitByteDelay sleeps for one inter-byte interval, cutting the sleep short
+// with an error if the context is cancelled first.
+func (trickleWriter *TrickleWriter) waitByteDelay(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(trickleWriter.byteDelay):
+		return nil
+	}
 }
