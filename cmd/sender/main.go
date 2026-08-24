@@ -14,8 +14,8 @@ import (
 	"time"
 
 	"github.com/stufro/serial-protocol/internal/terminal"
-	"github.com/stufro/serial-protocol/protocol"
-	"github.com/stufro/serial-protocol/transport"
+	"github.com/stufro/serial-protocol/internal/transport"
+	"github.com/stufro/serial-protocol/pathfinder"
 )
 
 type senderConfig struct {
@@ -42,7 +42,7 @@ func parseFlags(args []string) (*senderConfig, error) {
 	return cfg, nil
 }
 
-func printSenderHeader(cfg *senderConfig) {
+func printSenderHeader(out io.Writer, cfg *senderConfig) {
 	legend := fmt.Sprintf("%s[SYNC]%s %s[SEQ]%s %s[LEN]%s %s[PAYLOAD]%s %s[CRC32]%s",
 		terminal.Cyan, terminal.Reset,
 		terminal.Amber, terminal.Reset,
@@ -54,6 +54,7 @@ func printSenderHeader(cfg *senderConfig) {
 		terminal.Amber, terminal.Reset, terminal.Amber, terminal.Reset, terminal.Amber, terminal.Reset, terminal.Amber, terminal.Reset)
 
 	terminal.PrintBanner(
+		out,
 		"Pathfinder",
 		"ARES III / JPL DEEP SPACE NETWORK",
 		cfg.operator,
@@ -78,7 +79,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 	}
 	defer port.Close()
 
-	printSenderHeader(cfg)
+	printSenderHeader(out, cfg)
 
 	// Channel for user input lines to allow clean select on context cancellation
 	lineChan := make(chan string)
@@ -135,7 +136,12 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			payload := fmt.Sprintf("[%s | SOL %d | %s] %s", cfg.operator, cfg.sol, timestamp, line)
 			payloadBytes := []byte(payload)
 
-			frameBytes, err := protocol.Encode(seq, payloadBytes)
+			frame, err := pathfinder.NewFrame(seq, payloadBytes)
+			if err != nil {
+				fmt.Fprintf(out, "%s[ERROR] Failed to encode frame: %v%s\n", terminal.Red, err, terminal.Reset)
+				continue
+			}
+			frameBytes, err := frame.MarshalBinary()
 			if err != nil {
 				fmt.Fprintf(out, "%s[ERROR] Failed to encode frame: %v%s\n", terminal.Red, err, terminal.Reset)
 				continue
@@ -144,14 +150,14 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			// Live hex streaming across the wire
 			fmt.Fprintf(out, "  %s📡 Wire Stream:%s [", terminal.Amber, terminal.Reset)
 
-			tw := transport.NewTrickleWriter(port, cfg.byteDelay, func(index, total int, b byte) {
-				fmt.Fprint(out, terminal.ColorizeByte(index, len(payloadBytes), b))
+			trickleWriter := transport.NewTrickleWriter(port, cfg.byteDelay, func(index, total int, sentByte byte) {
+				fmt.Fprint(out, terminal.ColorizeByte(index, len(payloadBytes), sentByte))
 				if index+1 < total {
 					fmt.Fprint(out, " ")
 				}
 			})
 
-			n, writeErr := tw.WriteContext(ctx, frameBytes)
+			bytesWritten, writeErr := trickleWriter.WriteContext(ctx, frameBytes)
 			fmt.Fprintln(out, "]")
 
 			if writeErr != nil {
@@ -163,7 +169,7 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 			}
 
 			fmt.Fprintf(out, "  %s↳ [TX CONFIRMED]%s %d bytes wire | Seq #%d | Checksum: 0x%08X\n\n",
-				terminal.Green, terminal.Reset, n, seq, protocol.CRCSize)
+				terminal.Green, terminal.Reset, bytesWritten, seq, frame.CRC)
 
 			seq++
 		}
@@ -211,7 +217,7 @@ func handleCommand(line string, cfg *senderConfig, out io.Writer) (exit bool) {
 
 	case "/clear":
 		fmt.Fprint(out, "\033[H\033[2J")
-		printSenderHeader(cfg)
+		printSenderHeader(out, cfg)
 
 	case "/help":
 		fmt.Fprintln(out, terminal.Cyan+"\nAvailable Commands:"+terminal.Reset)

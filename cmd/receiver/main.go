@@ -12,8 +12,8 @@ import (
 	"syscall"
 
 	"github.com/stufro/serial-protocol/internal/terminal"
-	"github.com/stufro/serial-protocol/protocol"
-	"github.com/stufro/serial-protocol/transport"
+	"github.com/stufro/serial-protocol/internal/transport"
+	"github.com/stufro/serial-protocol/pathfinder"
 )
 
 type receiverConfig struct {
@@ -36,8 +36,9 @@ func parseFlags(args []string) (*receiverConfig, error) {
 	return cfg, nil
 }
 
-func printReceiverHeader(cfg *receiverConfig) {
+func printReceiverHeader(out io.Writer, cfg *receiverConfig) {
 	terminal.PrintBanner(
+		out,
 		"Pathfinder",
 		"DEEP SPACE NETWORK TELEMETRY RECEIVER",
 		cfg.station,
@@ -58,9 +59,9 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 	}
 	defer port.Close()
 
-	printReceiverHeader(cfg)
+	printReceiverHeader(out, cfg)
 
-	decoder := protocol.NewDecoder(port)
+	decoder := pathfinder.NewDecoder(port)
 	var mu sync.Mutex
 
 	// In-flight progress callback to render sliding 32-byte window on a single line
@@ -80,18 +81,18 @@ func run(ctx context.Context, args []string, out io.Writer) error {
 			terminal.ClearLine, terminal.Gray, stage, hexPreview, terminal.Reset)
 	})
 
-	frameChan := make(chan *protocol.Frame)
-	errChan := make(chan error)
+	frameChan := make(chan *pathfinder.Frame)
+	errChan := make(chan error, 1)
 
 	go func() {
 		for {
 			frame, err := decoder.NextFrame()
 			if err != nil {
+				// Any error here comes from the underlying reader (frame-level
+				// corruption is already resolved by resyncing inside NextFrame),
+				// so the stream is done.
 				errChan <- err
-				if errors.Is(err, io.EOF) {
-					return
-				}
-				continue
+				return
 			}
 			frameChan <- frame
 		}

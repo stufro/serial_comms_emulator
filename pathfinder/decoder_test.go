@@ -1,4 +1,4 @@
-package protocol
+package pathfinder
 
 import (
 	"bytes"
@@ -55,18 +55,18 @@ func TestStreamWithGarbageAndMultipleFrames(t *testing.T) {
 }
 
 func TestFragmentedStreamWithProgressCallback(t *testing.T) {
-	fBytes, _ := Encode(100, []byte("CHUNKED_STREAM_TEST"))
+	frameBytes, _ := Encode(100, []byte("CHUNKED_STREAM_TEST"))
 
-	r, w := io.Pipe()
+	pipeReader, pipeWriter := io.Pipe()
 	go func() {
-		defer w.Close()
-		for _, b := range fBytes {
-			w.Write([]byte{b})
+		defer pipeWriter.Close()
+		for _, singleByte := range frameBytes {
+			pipeWriter.Write([]byte{singleByte})
 		}
 	}()
 
 	progressCalls := 0
-	decoder := NewDecoder(r)
+	decoder := NewDecoder(pipeReader)
 	decoder.SetOnProgress(func(bufCopy []byte, stage string) {
 		progressCalls++
 		if len(bufCopy) == 0 {
@@ -83,5 +83,42 @@ func TestFragmentedStreamWithProgressCallback(t *testing.T) {
 	}
 	if progressCalls == 0 {
 		t.Error("Expected at least one progress callback invocation")
+	}
+}
+
+// eofWithDataReader returns its entire remaining payload together with
+// io.EOF on a single Read call, mirroring readers like strings.Reader and
+// bytes.Reader that report EOF on the same call as their final bytes
+// (see the io.Reader doc comment: "an instance of this general case is
+// that a Reader returning a non-zero number of bytes at the end of the
+// input stream may return either err == EOF or err == nil").
+type eofWithDataReader struct {
+	data []byte
+	done bool
+}
+
+func (r *eofWithDataReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.done = true
+	return n, io.EOF
+}
+
+func TestNextFrameParsesFinalFrameWhenReadReturnsDataAndEOFTogether(t *testing.T) {
+	frameBytes, _ := Encode(7, []byte("LAST_FRAME"))
+	decoder := NewDecoder(&eofWithDataReader{data: frameBytes})
+
+	frame, err := decoder.NextFrame()
+	if err != nil {
+		t.Fatalf("Expected final frame to be parsed despite EOF, got error: %v", err)
+	}
+	if frame.Seq != 7 || string(frame.Payload) != "LAST_FRAME" {
+		t.Fatalf("Unexpected frame: seq=%d, payload=%s", frame.Seq, string(frame.Payload))
+	}
+
+	if _, err := decoder.NextFrame(); !errors.Is(err, io.EOF) {
+		t.Fatalf("Expected EOF on next read, got %v", err)
 	}
 }

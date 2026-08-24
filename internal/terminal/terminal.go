@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -41,24 +42,24 @@ func ColorizeByte(idx, payloadLen int, b byte) string {
 	return fmt.Sprintf("%s%02X%s", color, b, Reset)
 }
 
-// PrintBanner renders the common ASCII mission header.
-func PrintBanner(title, subtitle, station, port string, extraFields ...[2]string) {
-	fmt.Print(Orange)
-	fmt.Println(`  ____       _   _        __ _           _             `)
-	fmt.Println(` |  _ \ __ _| |_| |__   / _(_)_ __   __| | ___ _ __   `)
-	fmt.Println(` | |_) / _` + "`" + ` | __| '_ \ | |_| | '_ \ / _` + "`" + ` |/ _ \ '__|  `)
-	fmt.Println(` |  __/ (_| | |_| | | ||  _| | | | | (_| |  __/ |     `)
-	fmt.Println(` |_|   \__,_|\__|_| |_||_| |_|_| |_|\__,_|\___|_|     `)
-	fmt.Printf("        %s\n", subtitle)
-	fmt.Print(Reset)
-	fmt.Println(Dim + strings.Repeat("─", 64) + Reset)
-	fmt.Printf("%s[STATION]%s    %s%s%s\n", Amber, Reset, Bold, station, Reset)
-	fmt.Printf("%s[PORT]%s       %s\n", Amber, Reset, port)
+// PrintBanner renders the common ASCII mission header to the given writer.
+func PrintBanner(out io.Writer, title, subtitle, station, port string, extraFields ...[2]string) {
+	fmt.Fprint(out, Orange)
+	fmt.Fprintln(out, `  ____       _   _        __ _           _             `)
+	fmt.Fprintln(out, ` |  _ \ __ _| |_| |__   / _(_)_ __   __| | ___ _ __   `)
+	fmt.Fprintln(out, ` | |_) / _`+"`"+` | __| '_ \ | |_| | '_ \ / _`+"`"+` |/ _ \ '__|  `)
+	fmt.Fprintln(out, ` |  __/ (_| | |_| | | ||  _| | | | | (_| |  __/ |     `)
+	fmt.Fprintln(out, ` |_|   \__,_|\__|_| |_||_| |_|_| |_|\__,_|\___|_|     `)
+	fmt.Fprintf(out, "        %s\n", subtitle)
+	fmt.Fprint(out, Reset)
+	fmt.Fprintln(out, Dim+strings.Repeat("─", 64)+Reset)
+	fmt.Fprintf(out, "%s[STATION]%s    %s%s%s\n", Amber, Reset, Bold, station, Reset)
+	fmt.Fprintf(out, "%s[PORT]%s       %s\n", Amber, Reset, port)
 
 	for _, field := range extraFields {
-		fmt.Printf("%s[%s]%s%s\n", Amber, field[0], Reset, field[1])
+		fmt.Fprintf(out, "%s[%s]%s%s\n", Amber, field[0], Reset, field[1])
 	}
 
-	fmt.Println(Dim + strings.Repeat("─", 64) + Reset)
-	fmt.Println()
+	fmt.Fprintln(out, Dim+strings.Repeat("─", 64)+Reset)
+	fmt.Fprintln(out)
 }

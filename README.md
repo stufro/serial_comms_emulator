@@ -51,7 +51,7 @@ When you transmit a message, you will see each hex byte rendered in real time as
 ```text
 [WATNEY (ARES 3 HAB) | SOL 135 | SEQ #001] > BRING ME HOME
   📡 Wire Stream: [AA 55 00 00 00 01 00 34 5B 57 41 54 ... 2B 4A 91 C2]
-  ↳ [TX CONFIRMED] 64 bytes wire | Seq #1 | Checksum: 0x00000004
+  ↳ [TX CONFIRMED] 64 bytes wire | Seq #1 | Checksum: 0x8F3A2C91
 ```
 
 ---
