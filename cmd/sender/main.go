@@ -147,18 +147,8 @@ func run(ctx context.Context, args []string, in io.Reader, out io.Writer) error 
 				continue
 			}
 
-			// Live hex streaming across the wire
-			fmt.Fprintf(out, "  %s📡 Wire Stream:%s [", terminal.Amber, terminal.Reset)
-
-			trickleWriter := transport.NewTrickleWriter(port, cfg.byteDelay, func(index, total int, sentByte byte) {
-				fmt.Fprint(out, terminal.ColorizeByte(index, len(payloadBytes), sentByte))
-				if index+1 < total {
-					fmt.Fprint(out, " ")
-				}
-			})
-
+			trickleWriter := transport.NewTrickleWriter(port, cfg.byteDelay)
 			bytesWritten, writeErr := trickleWriter.WriteContext(ctx, frameBytes)
-			fmt.Fprintln(out, "]")
 
 			if writeErr != nil {
 				fmt.Fprintf(out, "  %s[TX FAILED: %v]%s\n\n", terminal.Red, writeErr, terminal.Reset)

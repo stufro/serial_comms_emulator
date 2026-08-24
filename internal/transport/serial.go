@@ -35,23 +35,18 @@ func OpenPort(portName string, baudRate int) (io.ReadWriteCloser, error) {
 	return nil, fmt.Errorf("failed to open port %q: serial err=(%w), file err=(%w)", portName, serialErr, fileErr)
 }
 
-// ByteSentCallback is invoked after each byte is transmitted by TrickleWriter.
-type ByteSentCallback func(index int, total int, sentByte byte)
-
 // TrickleWriter wraps an io.Writer to write bytes sequentially with an interval between each byte,
 // simulating low-bandwidth serial serialization or radio transmission delay.
 type TrickleWriter struct {
-	writer     io.Writer
-	byteDelay  time.Duration
-	onByteSent ByteSentCallback
+	writer    io.Writer
+	byteDelay time.Duration
 }
 
 // NewTrickleWriter creates a TrickleWriter with the given delay and optional per-byte callback.
-func NewTrickleWriter(writer io.Writer, byteDelay time.Duration, onByteSent ByteSentCallback) *TrickleWriter {
+func NewTrickleWriter(writer io.Writer, byteDelay time.Duration) *TrickleWriter {
 	return &TrickleWriter{
-		writer:     writer,
-		byteDelay:  byteDelay,
-		onByteSent: onByteSent,
+		writer:    writer,
+		byteDelay: byteDelay,
 	}
 }
 
@@ -68,11 +63,6 @@ func (trickleWriter *TrickleWriter) WriteContext(ctx context.Context, data []byt
 
 	if trickleWriter.byteDelay <= 0 {
 		written, err := trickleWriter.writer.Write(data)
-		if trickleWriter.onByteSent != nil {
-			for index, sentByte := range data[:written] {
-				trickleWriter.onByteSent(index, len(data), sentByte)
-			}
-		}
 		return written, err
 	}
 
@@ -92,10 +82,6 @@ func (trickleWriter *TrickleWriter) WriteContext(ctx context.Context, data []byt
 			return totalSent, err
 		}
 		totalSent += written
-
-		if trickleWriter.onByteSent != nil {
-			trickleWriter.onByteSent(index, len(data), sentByte)
-		}
 
 		if index+1 < len(data) {
 			select {

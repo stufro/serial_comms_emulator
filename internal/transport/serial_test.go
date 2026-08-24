@@ -43,12 +43,7 @@ func TestTrickleWriter(t *testing.T) {
 	data := []byte("HELLO")
 	byteDelay := 5 * time.Millisecond
 
-	var sentIndices []int
-	onByte := func(index, total int, sentByte byte) {
-		sentIndices = append(sentIndices, index)
-	}
-
-	trickleWriter := NewTrickleWriter(&destination, byteDelay, onByte)
+	trickleWriter := NewTrickleWriter(&destination, byteDelay)
 
 	start := time.Now()
 	written, err := trickleWriter.Write(data)
@@ -63,9 +58,6 @@ func TestTrickleWriter(t *testing.T) {
 	if destination.String() != "HELLO" {
 		t.Errorf("Expected content 'HELLO', got '%s'", destination.String())
 	}
-	if len(sentIndices) != len(data) {
-		t.Errorf("Expected %d callbacks, got %d", len(data), len(sentIndices))
-	}
 	// 4 inter-byte sleeps of 5ms = ~20ms minimum
 	if elapsed < 15*time.Millisecond {
 		t.Errorf("Elapsed time %v was too fast for trickle delay", elapsed)
@@ -75,7 +67,7 @@ func TestTrickleWriter(t *testing.T) {
 func TestTrickleWriterContextCancellation(t *testing.T) {
 	var destination bytes.Buffer
 	data := []byte("LONG_MESSAGE_TO_BE_CANCELED")
-	trickleWriter := NewTrickleWriter(&destination, 50*time.Millisecond, nil)
+	trickleWriter := NewTrickleWriter(&destination, 50*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
