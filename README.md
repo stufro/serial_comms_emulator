@@ -11,7 +11,6 @@ An interactive serial communications emulator themed after **The Martian** (Ares
 | Sync Word (2B)    | Sequence ID (4B)  | Payload Length (2B) | Payload (N Bytes)       | CRC32 (4B)         |
 | 0xAA 0x55         | uint32 (BigEndian)| uint16 (BigEndian)  | Telemetry / Raw bytes   | uint32 (BigEndian) |
 +-------------------+-------------------+---------------------+-------------------------+--------------------+
-  [Cyan]              [Yellow]            [Magenta]             [Green]                   [Orange]
 ```
 
 - **Sync Word (`0xAA 0x55`)**: Delimits frame start across unstructured streams.
@@ -46,12 +45,22 @@ go run ./cmd/sender -port /tmp/ttyV0 -operator "WATNEY (HAB)" -sol 135 -byte-del
 
 ## Live Raw Frame Build-Up
 
-When you transmit a message, you will see each hex byte rendered in real time as it hits the wire, color-coded by protocol field:
+To watch the bytes travel across the "wire" in real-time, change the `socat` command to include an intermediary dump into a file:
+```bash
+socat PTY,link=/tmp/ttyV0,raw,echo=0 - | tee tmp/wire.bin | socat - PTY,link=/tmp/ttyV1,raw,echo=0
+```
 
-```text
-[WATNEY (ARES 3 HAB) | SOL 135 | SEQ #001] > BRING ME HOME
-  📡 Wire Stream: [AA 55 00 00 00 01 00 34 5B 57 41 54 ... 2B 4A 91 C2]
-  ↳ [TX CONFIRMED] 64 bytes wire | Seq #1 | Checksum: 0x8F3A2C91
+Then, in a separate terminal, run:
+```bash
+tail -f tmp/wire.bin | hexdump -C
+```
+
+Example output:
+```
+00000000  aa 55 00 00 00 01 00 34  5b 57 41 54 4e 45 59 20  |.U.....4[WATNEY |
+00000010  28 41 52 45 53 20 33 20  48 41 42 29 20 7c 20 53  |(ARES 3 HAB) | S|
+00000020  4f 4c 20 31 33 35 20 7c  20 31 30 3a 31 34 3a 35  |OL 135 | 10:14:5|
+00000030  34 5d 20 48 69 20 74 68  65 72 65 2e d2 1b 56 b3  |4] Hi there...V.|
 ```
 
 ---
